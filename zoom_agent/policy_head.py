@@ -162,6 +162,7 @@ class ActiveZoomPolicyHead(nn.Module):
         self._roi_cache: Dict[Tuple[int, int, int, torch.device, torch.dtype], Tensor] = {}
         self._eval_cuda_graph_enabled: bool = False
         self._eval_graph_bundle: Optional[Dict] = None
+        self._exact_eval_parity: bool = False
 
         # 1. Trainable visual projection: Conv1x1(C_vis -> 256) + GroupNorm + SiLU
         vis_gn_groups = _resolve_num_groups(self.visual_proj_dim, 16)
@@ -296,6 +297,16 @@ class ActiveZoomPolicyHead(nn.Module):
         breakdown["total"] = actual_total
         return breakdown
 
+    def set_exact_eval_parity(self, enabled: bool = True) -> "ActiveZoomPolicyHead":
+        """Disable PyTorch MHA C++ fastpath during Transformer forward so train() and eval() match bitwise.
+
+        Recommended for Phase 3 GRPO online & reference policies (with ``dropout_override=0.0``)
+        so Step-0 ``r_i(theta) == 1.0`` and ``D_KL(pi_theta || pi_ref) == 0.0`` are bitwise exact.
+        """
+        self._exact_eval_parity = bool(enabled)
+        self.release_eval_cuda_graph()
+        return self
+
     def clone_as_reference(self) -> "ActiveZoomPolicyHead":
         """Create a deeply-copied frozen reference policy pi_ref for GRPO KL regularization."""
         saved_bundle = self._eval_graph_bundle
@@ -420,10 +431,28 @@ class ActiveZoomPolicyHead(nn.Module):
         ckpt: Dict,
         map_location: torch.device | str = "cpu",
         strict: bool = True,
+        dropout_override: Optional[float] = None,
+        as_reference: bool = False,
+        exact_eval_parity: bool = False,
     ) -> "ActiveZoomPolicyHead":
-        """Reconstruct CandidateGrid + ActiveZoomPolicyHead cleanly from ``to_checkpoint_dict``."""
+        """Reconstruct CandidateGrid + ActiveZoomPolicyHead cleanly from ``to_checkpoint_dict``.
+
+        Args:
+            ckpt: Checkpoint dictionary emitted by ``to_checkpoint_dict``.
+            map_location: Target device for reconstructed module.
+            strict: Passed to ``load_state_dict``.
+            dropout_override: Optional dropout rate override (e.g. ``0.0`` for Phase 3 GRPO
+                online policy updates so Step-0 ``r_i(theta) == 1.0`` and ``D_KL == 0.0``).
+            as_reference: If ``True``, immediately sets ``eval()`` and ``requires_grad_(False)``
+                so the loaded module is safe to use as frozen GRPO reference policy ``pi_ref``.
+            exact_eval_parity: If ``True``, disables PyTorch MHA C++ fastpath during Transformer
+                forward so ``train()`` and ``eval()`` paths are bitwise identical (0.0 error).
+        """
         if "policy_config" not in ckpt or "grid_config" not in ckpt or "state_dict" not in ckpt:
             raise KeyError("Checkpoint dict must contain 'policy_config', 'grid_config', and 'state_dict'.")
+        if dropout_override is not None and not (0.0 <= float(dropout_override) < 1.0):
+            raise ValueError(f"dropout_override must be in [0.0, 1.0), got {dropout_override}")
+
         g_cfg = ckpt["grid_config"]
         grid = CandidateGrid(
             grid_rows=int(g_cfg["grid_rows"]),
@@ -440,6 +469,7 @@ class ActiveZoomPolicyHead(nn.Module):
                 raise RuntimeError("Reconstructed CandidateGrid windows do not match checkpoint grid_config.")
 
         p_cfg = ckpt["policy_config"]
+        resolved_dropout = float(p_cfg["dropout"]) if dropout_override is None else float(dropout_override)
         policy = cls(
             grid=grid,
             visual_channels=int(p_cfg["visual_channels"]),
@@ -454,13 +484,20 @@ class ActiveZoomPolicyHead(nn.Module):
             num_transformer_layers=int(p_cfg["num_transformer_layers"]),
             num_heads=int(p_cfg["num_heads"]),
             ffn_dim=int(p_cfg["ffn_dim"]),
-            dropout=float(p_cfg["dropout"]),
+            dropout=resolved_dropout,
             use_film=bool(p_cfg["use_film"]),
             k_max=int(p_cfg["k_max"]),
             nms_window_iou=float(p_cfg["nms_window_iou"]),
         )
         policy.load_state_dict(ckpt["state_dict"], strict=strict)
-        return policy.to(torch.device(map_location))
+        policy = policy.to(torch.device(map_location))
+        if exact_eval_parity:
+            policy.set_exact_eval_parity(True)
+        if as_reference:
+            policy.eval()
+            for p in policy.parameters():
+                p.requires_grad = False
+        return policy
 
     def save_checkpoint(self, path: str | Path, extra: Optional[Dict] = None) -> Path:
         out_path = Path(path)
@@ -474,9 +511,19 @@ class ActiveZoomPolicyHead(nn.Module):
         path: str | Path,
         map_location: torch.device | str = "cpu",
         strict: bool = True,
+        dropout_override: Optional[float] = None,
+        as_reference: bool = False,
+        exact_eval_parity: bool = False,
     ) -> "ActiveZoomPolicyHead":
         ckpt = torch.load(str(path), map_location="cpu", weights_only=False)
-        return cls.from_checkpoint_dict(ckpt, map_location=map_location, strict=strict)
+        return cls.from_checkpoint_dict(
+            ckpt,
+            map_location=map_location,
+            strict=strict,
+            dropout_override=dropout_override,
+            as_reference=as_reference,
+            exact_eval_parity=exact_eval_parity,
+        )
 
     def _forward_eval_cuda_graph(self, state: AgentBatchState) -> Tensor:
         key = (state.batch_size, state.grid_size, state.device)
@@ -600,7 +647,15 @@ class ActiveZoomPolicyHead(nn.Module):
 
         # 5. Cross-region competition Transformer over [B, 19, D]
         tokens_in = torch.cat([t_win, t_global], dim=1)
-        tokens_out = self.transformer(tokens_in)
+        if self._exact_eval_parity:
+            prev_fastpath = torch.backends.mha.get_fastpath_enabled()
+            torch.backends.mha.set_fastpath_enabled(False)
+            try:
+                tokens_out = self.transformer(tokens_in)
+            finally:
+                torch.backends.mha.set_fastpath_enabled(prev_fastpath)
+        else:
+            tokens_out = self.transformer(tokens_in)
         return z, tokens_out
 
     def forward(self, state: AgentBatchState) -> Tensor:
@@ -1134,6 +1189,12 @@ class ActiveZoomPolicyHead(nn.Module):
         """Compute exact analytical D_KL(pi_theta || pi_ref) [B] given ref policy module or ref logits."""
         logits = self.forward(state)
         if isinstance(ref_policy_or_logits, nn.Module):
+            if ref_policy_or_logits.training:
+                raise RuntimeError(
+                    "Reference policy passed to kl_divergence() MUST be in eval() mode "
+                    "(call ref_policy.eval() or load with as_reference=True) to prevent "
+                    "stochastic Dropout noise in D_KL(pi_theta || pi_ref)."
+                )
             with torch.no_grad():
                 ref_logits = ref_policy_or_logits(state).detach()
         else:
