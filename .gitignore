@@ -1,0 +1,26 @@
+# Python bytecode & caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*.egg-info/
+
+# Atomic temp files & OS artifacts
+*.tmp.*
+.DS_Store
+Thumbs.db
+
+# Model checkpoints, weights, and binary feature caches
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.bin
+*.pkl
+*.npy
+*.npz
+*.log
+
+# Outputs & local design notes
+/outputs/
+/SmolVLM.md
