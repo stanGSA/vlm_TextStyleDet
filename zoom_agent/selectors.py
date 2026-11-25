@@ -144,6 +144,33 @@ class OracleSelector:
         self.nms_window_iou = float(nms_window_iou)
         self._win_iou = grid.window_iou_matrix()
 
+    @classmethod
+    def for_policy(
+        cls,
+        policy,
+        weak_class_ids: Sequence[int] = DEFAULT_WEAK_CLASS_IDS,
+        fn_score_floor: float = 0.25,
+        refine_iou_ceil: float = 0.75,
+        min_containment_ioa: float = 0.85,
+        max_gt_to_window_area_ratio: float = 0.70,
+    ) -> "OracleSelector":
+        """Build an SFT pseudo-label OracleSelector strictly aligned to ``policy`` action legality.
+
+        Binds ``grid``, ``k_max``, and ``nms_window_iou`` (default 0.35) directly from ``policy``
+        so every mined trajectory is guaranteed legal under ``policy.log_prob``, while keeping
+        Phase-0's historical ``OracleSelector(..., nms_window_iou=0.45)`` default unchanged.
+        """
+        return cls(
+            grid=policy.grid,
+            k_max=policy.k_max,
+            weak_class_ids=weak_class_ids,
+            fn_score_floor=fn_score_floor,
+            refine_iou_ceil=refine_iou_ceil,
+            min_containment_ioa=min_containment_ioa,
+            max_gt_to_window_area_ratio=max_gt_to_window_area_ratio,
+            nms_window_iou=policy.nms_window_iou,
+        )
+
     def config_dict(self) -> Dict:
         return {
             "k_max": self.k_max,
