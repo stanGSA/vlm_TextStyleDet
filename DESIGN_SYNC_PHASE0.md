@@ -14,3 +14,19 @@
 | **边缘截断过滤** | 内边缘 `< 5 px` 的大截断框过滤 | 原图裁剪像素尺度下距非外边界内切线 `< 5.0 px` 且面积 `>= 144 px² (12×12)` 的框过滤（外边界豁免，与草案 `< 5 px` 完全对齐） | 经 `daytime_clear/train` 源域标定验证（`source_only_calibration_fp32.json`），`5.0 px` + `crop_max_proposals=300` 在精度与速度上均优于 `8.0 px / 1000 proposals` |
 | **双视图 WBF 与对称 NMS** | `w_g=1.0, w_l=0.85` WBF | 同视图互斥聚类（根治 `P1-01` 吞框）、`iou_thr=0.55`、`max_detections=100`（对齐全局 ROI Head 上限）；对称 NMS 共享完全相同的候选过滤阈值，仅将坐标加权替换为最高加权分单框保留 | 消除输出框容量（100 vs 150）与候选阈值不对称造成的消融偏置（根治 `P1-03`） |
 | **两级离线诊断 Oracle** | 统称 Oracle | 显式拆分为 `static_oracle_*`（仅按静态 GT 漏检与 `IoU<0.75` 覆盖选窗，对应 Stage-1 SFT 伪标签参考）与 `reward_oracle_*`（候选池正奖励子集参考，对应 Stage-2 环境反馈动机） | 消除单一受限奖励 Oracle 表述歧义（解决 `P2-01`） |
+
+---
+
+## Phase 3（Stage-2 GRPO）锁定超参与红队审计同步
+
+以下为 `outputs/phase3/policy_grpo.pth`（SHA256 `030f5151f486e16d...`，最优轮次 Epoch 2，训练 Manifest `4bb1df5ad206ea42...`）对应的正式锁定超参与审计整改规范（对应 Phase 3 红队审计 `P1-01 / P1-02 / P1-03 / P2-01~04 / P3-01~02`），源码 `GRPOTrainConfig`、`GRPORewardConfig`、`run_phase3_grpo.py` 默认值已全部同步对齐：
+
+| 模块 / 项目 | 初始草案（`SmolVLM.md` / 初版默认值） | Phase 3 锁定实现规范（已封签） | 同步与审计依据 |
+| :--- | :--- | :--- | :--- |
+| **源域训练/验证规模** | 未固定 / 默认 `dev=1000` | `source_train = 2,000` 视图（1,000 图 × 2）+ `source_dev = 600` 视图（300 图 × 2），`shard_group_size = 2` | 严格零目标域、零 `daytime_clear/test` 泄漏；`source_dev` 250 图 E2E 仅作源域开发验证集闭环验收，最终无偏测试留待 Phase 4 `daytime_clear/test` 与四目标域冻结评测（`P1-02`） |
+| **GRPO 优化超参** | `B=32, ep=8, ppo=3, lr=5e-5→5e-6, β_KL=0.04, α_ent=0.005, T=1.0, flush=16` | **`B=8, G=4, ep=6, ppo=2, lr=8e-6→1e-6, β_KL=0.16, α_ent=0.015, clip_eps=0.2, flush=32`** | 适配 RTX 5060 8GB 笔记本热负载（峰值分配显存 `1.497 GiB`），同时收紧 KL 信任域（最优 Epoch 2 `D_KL=0.745, H=1.195`） |
+| **双温度策略目标** | 单一温度 `T=1.0` | 采样与重要性比用 $T_{\text{samp}}=1.05$，解析 KL 与熵正则用 $T_{\text{reg}}=1.0$（开放 `--kl_entropy_temp`） | 轻度提升探索并锚定部署分布（梯度余弦相似度 `0.999906`，贪心解码 `0` 翻转，`P2-01`） |
+| **平滑增量奖励函数** | $\lambda_1=2.0, \lambda_2=3.0, \lambda_3=0.05$（无显式 FP 项） | **$\lambda_1=2.0, \lambda_2=3.5$（`0.45·AP50:95 + 0.30·AP75 + 0.25·MatchedIoU`）, $\lambda_{\text{fp}}=0.90, \lambda_3=0.045$**，`R(()) == 0.0` | 强化 `AP75` 紧致定位与背景 FP 抑制；封签版 `fp_score_thr=0.05`，后续新重训消融可通过 `--fp_score_thr 0.04` 闭合 `[0.042, 0.050)` 缺席类 FP 缝隙（`P2-03`） |
+| **双窗融合顺序一致** | 训练 `sorted()`、推理原序 | `GRPODetectionEnvironment.fuse_action` 与 `AZAgentDetector.predict` 统一按 `tuple(sorted(action))` 规范化后融合（`output.action` 保留原策略步序） | 消除等置信度平局下 `WBF/NMS` 依赖窗口输入顺序的潜在跳变（`P1-03`）；E2E 评测统一启用 `exact_eval_parity=True` |
+| **断点续训与日志** | 未持久化 `env_telemetry`，JSONL 直接追加 | `grpo_resume_state.pt` 持久化并累加 `env_telemetry_counters`；`--resume` 原子截断 `grpo_train_log.jsonl` 至 `ckpt["global_step"]` 并补录 `approx_kl_old / max_ratio_err_from_1` | 防止跨续训计数归零与半轮中断重复追加（`P1-01`） |
+| **跨天气聚焦与测速口径** | — | 定性表述统一为**“基于边际净收益感知的选择性聚焦”**；同表 FPS 须在同一冷却配置下同批次实测，Δ 差值注明由未舍入原始值计算 | 准确反映 `low_light` 高聚焦与 `fog/compound_adverse` 主动弃权行为，消除跨阶段测速与 2 位舍入歧义（`P2-02 / P2-04`） |

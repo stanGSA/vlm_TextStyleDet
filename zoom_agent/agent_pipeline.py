@@ -282,8 +282,13 @@ class AZAgentDetector(nn.Module):
             else:
                 used_slow_path = True
                 t3 = time.perf_counter()
+                # P1-03 Audit Fix: Canonicalize unordered window set via sorted() prior to crop
+                # execution & WBF/NMS fusion so (w1, w2) and (w2, w1) match GRPODetectionEnvironment
+                # bitwise even under equal-confidence tie-breaking (e.g. BF16 or NMS ablation).
+                # AgentInferenceOutput.action preserves the policy's step-order trajectory.
+                canon_action = tuple(sorted(action))
                 crop_dets: List[Dict[str, Tensor]] = []
-                for wid in action:
+                for wid in canon_action:
                     rect = self.grid.windows[wid].to_pixel_xyxy(orig_w, orig_h)
                     selected_crop_boxes.append(rect)
                     crop_dets.append(self.detector_wrapper.forward_single_crop(pil_image, rect))
